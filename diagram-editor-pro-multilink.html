@@ -882,7 +882,9 @@ Click to enter link mode, then:
     needsRender: false,
     renderScheduled: false,
     canvasWidth: 0,
-    canvasHeight: 0
+    canvasHeight: 0,
+    linkingAnimationId: null,
+    lastMouseEvent: null
   };
 
   // Interaction state
@@ -946,6 +948,19 @@ Click to enter link mode, then:
       node.height = utils.clamp(utils.to8(node.height), CONSTANTS.MIN_SIZE.height, CONSTANTS.MAX_SIZE.height);
     },
     
+    ensureValidPosition: (node) => {
+      // Define reasonable canvas bounds (with some padding)
+      const CANVAS_PADDING = 50;
+      const MIN_X = -1000; // Allow some off-screen positioning
+      const MIN_Y = -1000;
+      const MAX_X = 5000;  // Reasonable maximum bounds
+      const MAX_Y = 5000;
+      
+      // Clamp position to valid bounds
+      node.x = utils.clamp(node.x, MIN_X, MAX_X - node.width);
+      node.y = utils.clamp(node.y, MIN_Y, MAX_Y - node.height);
+    },
+    
     getNode: (id) => state.nodes.find(n => n.id === id) || null,
     
     snapVal: (v, step) => Math.round(v / step) * step,
@@ -984,6 +999,7 @@ parentId: null,
       
       const node = { ...defaults, ...partial };
       utils.ensureValidSize(node);
+      utils.ensureValidPosition(node);
       state.nodes.push(node);
       hitTestCache.clear(); // Clear cache when nodes are added
       try { historyManager.push(); } catch (e) {}
@@ -1149,9 +1165,11 @@ wouldCreateCycle: (parentId, childId) => {
       }
       
       return false;
-    },
+    }
+  };
 
-    
+  // Selection management
+  const selection = {
     add: (id) => {
       state.selectedIds.add(id);
       updateUI();
@@ -1173,6 +1191,11 @@ wouldCreateCycle: (parentId, childId) => {
     set: (ids) => {
       state.selectedIds.clear();
       (Array.isArray(ids) ? ids : [ids]).forEach(id => state.selectedIds.add(id));
+      updateUI();
+    },
+    
+    clear: () => {
+      state.selectedIds.clear();
       updateUI();
     },
     
@@ -1232,7 +1255,12 @@ wouldCreateCycle: (parentId, childId) => {
       nodes.sort((a, b) => a.x - b.x);
       const totalWidth = nodes.reduce((sum, n) => sum + n.width, 0);
       const totalSpace = nodes[nodes.length - 1].x + nodes[nodes.length - 1].width - nodes[0].x;
-      const gap = (totalSpace - totalWidth) / (nodes.length - 1);
+      
+      // Prevent division by zero
+      const gapCount = nodes.length - 1;
+      if (gapCount <= 0) return;
+      
+      const gap = Math.max(0, (totalSpace - totalWidth) / gapCount);
       
       let currentX = nodes[0].x;
       nodes.forEach(n => {
@@ -1305,6 +1333,20 @@ wouldCreateCycle: (parentId, childId) => {
 
   // Rendering functions
   const renderer = {
+    // Cache computed styles to avoid repeated DOM queries
+    cachedStyles: null,
+    
+    getCachedStyles() {
+      if (!this.cachedStyles) {
+        this.cachedStyles = getComputedStyle(document.documentElement);
+      }
+      return this.cachedStyles;
+    },
+    
+    clearStyleCache() {
+      this.cachedStyles = null;
+    },
+    
     setCanvasSize: () => {
       try {
         if (!els.canvas || !els.canvasContainer) return false;
@@ -1343,7 +1385,7 @@ wouldCreateCycle: (parentId, childId) => {
       
       // Cache styles for better performance
       if (!renderer.gridColor) {
-        const styles = getComputedStyle(document.documentElement);
+        const styles = renderer.getCachedStyles();
         renderer.gridColor = styles.getPropertyValue('--grid-strong').trim();
       }
       
@@ -1393,7 +1435,7 @@ wouldCreateCycle: (parentId, childId) => {
         context.save();
         context.lineWidth = 2 / state.zoom;
         context.setLineDash([6, 4]);
-        context.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+        context.strokeStyle = renderer.getCachedStyles().getPropertyValue('--accent').trim();
         renderer.pathForNode(context, node, CONSTANTS.SELECTION_PADDING);
         context.stroke();
         context.restore();
@@ -1588,7 +1630,7 @@ wouldCreateCycle: (parentId, childId) => {
       ctx.save();
       ctx.clearRect(0, 0, w, h);
       
-      const styles = getComputedStyle(document.documentElement);
+      const styles = renderer.getCachedStyles();
       ctx.fillStyle = styles.getPropertyValue('--canvas').trim();
       ctx.fillRect(0, 0, w, h);
       
@@ -1681,7 +1723,25 @@ wouldCreateCycle: (parentId, childId) => {
       
       // Continue animating if in linking mode for visual feedback
       if (interaction.linking && interaction.linking.mode === 'active' && interaction.linking.firstNodeId) {
-        setTimeout(render, 100); // Animate at 10fps for smooth marching ants
+        // Use requestAnimationFrame instead of setTimeout to prevent memory leaks
+        // and ensure proper cleanup when linking mode ends
+        if (!state.linkingAnimationId) {
+          const animate = () => {
+            if (interaction.linking && interaction.linking.mode === 'active' && interaction.linking.firstNodeId) {
+              state.linkingAnimationId = requestAnimationFrame(animate);
+              render();
+            } else {
+              state.linkingAnimationId = null;
+            }
+          };
+          state.linkingAnimationId = requestAnimationFrame(animate);
+        }
+      } else {
+        // Clean up animation when linking mode ends
+        if (state.linkingAnimationId) {
+          cancelAnimationFrame(state.linkingAnimationId);
+          state.linkingAnimationId = null;
+        }
       }
     } catch (error) {
       ErrorBoundary.handle(error, 'canvas-render', 'performRender');
@@ -1697,12 +1757,14 @@ wouldCreateCycle: (parentId, childId) => {
   // Hit testing with caching
   const hitTestCache = {
     paths: new Map(),
+    sortedNodes: null,
     zoom: null,
     panX: null,
     panY: null,
     
     clear() {
       this.paths.clear();
+      this.sortedNodes = null;
       this.zoom = null;
       this.panX = null;
       this.panY = null;
@@ -1727,7 +1789,12 @@ wouldCreateCycle: (parentId, childId) => {
         hitTestCache.panY = state.panY;
       }
       
-      const sortedNodes = [...state.nodes].sort((a, b) => (b.zIndex || 0) - (a.zIndex || 0));
+      // Use cached sorted nodes if available
+      let sortedNodes = hitTestCache.sortedNodes;
+      if (!sortedNodes || sortedNodes.length !== state.nodes.length) {
+        sortedNodes = [...state.nodes].sort((a, b) => (b.zIndex || 0) - (a.zIndex || 0));
+        hitTestCache.sortedNodes = sortedNodes;
+      }
       
       for (const node of sortedNodes) {
         try {
@@ -1736,7 +1803,16 @@ wouldCreateCycle: (parentId, childId) => {
             continue;
           }
           
-          // Detailed hit test - x and y are already in canvas coordinates from getMousePos
+          // For simple shapes, use faster geometric hit testing
+          if (node.shape === 'rect' || node.shape === 'rounded' || node.shape === 'stadium') {
+            // Simple rectangular hit test for basic shapes
+            if (x >= node.x && x <= node.x + node.width && y >= node.y && y <= node.y + node.height) {
+              return node.id;
+            }
+            continue;
+          }
+          
+          // For complex shapes, use path-based hit testing
           ctx.save();
           renderer.pathForNode(ctx, node);
           const hit = ctx.isPointInPath(x, y);
@@ -1823,79 +1899,112 @@ wouldCreateCycle: (parentId, childId) => {
 
   // Commands
   function newDiagram() {
-    if (state.isDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
-    
-    state.nodes = [];
-    state.selectedIds.clear();
-    state.idCounter = 1;
-    state.zoom = 1;
-    state.panX = 0;
-    state.panY = 0;
-    historyManager.push();
-    updateUI();
-    render();
-    utils.showToast('New diagram created');
+    try {
+      if (state.isDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
+      
+      state.nodes = [];
+      state.selectedIds.clear();
+      state.idCounter = 1;
+      state.zoom = 1;
+      state.panX = 0;
+      state.panY = 0;
+      historyManager.push();
+      updateUI();
+      render();
+      utils.showToast('New diagram created');
+    } catch (error) {
+      ErrorBoundary.handle(error, 'commands', 'newDiagram');
+      utils.showToast('Failed to create new diagram');
+    }
   }
 
   function deleteSelected() {
-    if (state.selectedIds.size === 0) return;
-    
-    const count = state.selectedIds.size;
-    nodeManager.delete(Array.from(state.selectedIds));
-    historyManager.push();
-    updateUI();
-    render();
-    utils.showToast(`Deleted ${count} node(s)`);
+    try {
+      if (state.selectedIds.size === 0) return;
+      
+      const count = state.selectedIds.size;
+      nodeManager.delete(Array.from(state.selectedIds));
+      historyManager.push();
+      updateUI();
+      render();
+      utils.showToast(`Deleted ${count} node(s)`);
+    } catch (error) {
+      ErrorBoundary.handle(error, 'commands', 'deleteSelected');
+      utils.showToast('Failed to delete selected nodes');
+    }
   }
 
   function copySelected() {
-    if (state.selectedIds.size === 0) return;
-    
-    state.clipboard = selection.getNodes().map(n => utils.deepClone(n));
-    if (els.pasteBtn) els.pasteBtn.disabled = false;
-    utils.showToast(`Copied ${state.clipboard.length} node(s)`);
+    try {
+      if (state.selectedIds.size === 0) return;
+      
+      state.clipboard = selection.getNodes().map(n => utils.deepClone(n));
+      if (els.pasteBtn) els.pasteBtn.disabled = false;
+      utils.showToast(`Copied ${state.clipboard.length} node(s)`);
+    } catch (error) {
+      ErrorBoundary.handle(error, 'commands', 'copySelected');
+      utils.showToast('Failed to copy selected nodes');
+    }
   }
 
   function paste() {
-    if (!state.clipboard || state.clipboard.length === 0) return;
-    
-    const newNodes = state.clipboard.map(node => {
-      return nodeManager.create({
-        ...node,
-        id: utils.genId(),
-        x: node.x + 20,
-        y: node.y + 20
+    try {
+      if (!state.clipboard || state.clipboard.length === 0) return;
+      
+      const newNodes = state.clipboard.map(node => {
+        return nodeManager.create({
+          ...node,
+          id: utils.genId(),
+          x: node.x + 20,
+          y: node.y + 20
+        });
       });
-    });
-    
-    selection.set(newNodes.map(n => n.id));
-    historyManager.push();
-    render();
-    utils.showToast(`Pasted ${newNodes.length} node(s)`);
+      
+      selection.set(newNodes.map(n => n.id));
+      historyManager.push();
+      render();
+      utils.showToast(`Pasted ${newNodes.length} node(s)`);
+    } catch (error) {
+      ErrorBoundary.handle(error, 'commands', 'paste');
+      utils.showToast('Failed to paste nodes');
+    }
   }
 
   function selectAll() {
-    selection.set(state.nodes.map(n => n.id));
-    render();
+    try {
+      selection.set(state.nodes.map(n => n.id));
+      render();
+    } catch (error) {
+      ErrorBoundary.handle(error, 'commands', 'selectAll');
+      utils.showToast('Failed to select all nodes');
+    }
   }
 
   function nudgeSelected(direction, large) {
-    if (state.selectedIds.size === 0) return;
-    
-    const distance = large ? CONSTANTS.NUDGE_LARGE : CONSTANTS.NUDGE_SMALL;
-    const nodes = selection.getNodes();
-    
-    nodes.forEach(node => {
-      switch (direction) {
-        case 'ArrowLeft': node.x -= distance; break;
-        case 'ArrowRight': node.x += distance; break;
-        case 'ArrowUp': node.y -= distance; break;
-        case 'ArrowDown': node.y += distance; break;
-      }
-    });
-    
-    historyManager.push();
-    render();
+    try {
+      if (state.selectedIds.size === 0) return;
+      
+      const distance = large ? CONSTANTS.NUDGE_LARGE : CONSTANTS.NUDGE_SMALL;
+      const nodes = selection.getNodes();
+      
+      nodes.forEach(node => {
+        switch (direction) {
+          case 'ArrowLeft': node.x -= distance; break;
+          case 'ArrowRight': node.x += distance; break;
+          case 'ArrowUp': node.y -= distance; break;
+          case 'ArrowDown': node.y += distance; break;
+        }
+        
+        // Ensure node stays within valid bounds after nudging
+        utils.ensureValidPosition(node);
+      });
+      
+      historyManager.push();
+      render();
+    } catch (error) {
+      ErrorBoundary.handle(error, 'commands', 'nudgeSelected');
+      utils.showToast('Failed to nudge selected nodes');
+    }
   }
 
   function toggleSnap() {
@@ -2037,6 +2146,7 @@ wouldCreateCycle: (parentId, childId) => {
     if (els.themeBtn) els.themeBtn.textContent = state.theme === 'dark' ? 'Dark' : 'Light';
     // Clear cached styles when theme changes
     renderer.gridColor = null;
+    renderer.clearStyleCache();
   }
 
   // Export functions
@@ -2253,15 +2363,22 @@ wouldCreateCycle: (parentId, childId) => {
     },
     
     handleMouseMove: (e) => {
+      // Store the latest mouse event for processing
+      state.lastMouseEvent = e;
+      
       // Throttle mouse move events for better performance
       if (mouseMoveThrottle) return;
       
       mouseMoveThrottle = requestAnimationFrame(() => {
         mouseMoveThrottle = null;
         
+        // Use the latest mouse event to avoid race conditions
+        const latestEvent = state.lastMouseEvent;
+        if (!latestEvent) return;
+        
         if (interaction.panning) {
-          const dx = e.clientX - interaction.panning.startX;
-          const dy = e.clientY - interaction.panning.startY;
+          const dx = latestEvent.clientX - interaction.panning.startX;
+          const dy = latestEvent.clientY - interaction.panning.startY;
           state.panX = interaction.panning.panX + dx / state.zoom;
           state.panY = interaction.panning.panY + dy / state.zoom;
           hitTestCache.clear(); // Clear hit test cache when panning
@@ -2270,7 +2387,7 @@ wouldCreateCycle: (parentId, childId) => {
         }
         
         if (interaction.dragging) {
-          const pos = utils.getMousePos(e);
+          const pos = utils.getMousePos(latestEvent);
           
           interaction.dragging.nodes.forEach(item => {
             const node = utils.getNode(item.id);
@@ -2286,14 +2403,17 @@ wouldCreateCycle: (parentId, childId) => {
             
             node.x = Math.round(newX);
             node.y = Math.round(newY);
+            
+            // Ensure node stays within valid bounds
+            utils.ensureValidPosition(node);
           });
           
           interaction.dragging.moved = true;
           hitTestCache.clear(); // Clear cache when nodes move
           render();
         } else if (interaction.selecting) {
-          interaction.selecting.endX = e.clientX;
-          interaction.selecting.endY = e.clientY;
+          interaction.selecting.endX = latestEvent.clientX;
+          interaction.selecting.endY = latestEvent.clientY;
           
           const rect = {
             x1: Math.min(interaction.selecting.startX, interaction.selecting.endX),
@@ -2326,10 +2446,14 @@ wouldCreateCycle: (parentId, childId) => {
     },
     
     handleMouseUp: () => {
+      // Clear any pending mouse move animation
       if (mouseMoveThrottle) {
         cancelAnimationFrame(mouseMoveThrottle);
         mouseMoveThrottle = null;
       }
+      
+      // Clear the last mouse event to prevent stale data
+      state.lastMouseEvent = null;
       
       if (interaction.dragging && interaction.dragging.moved) {
         historyManager.push();
@@ -2506,26 +2630,125 @@ Arrow keys: Nudge nodes
       const file = e.target.files[0];
       if (!file) return;
       
+      // Validate file size (max 10MB)
+      const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+      if (file.size > MAX_FILE_SIZE) {
+        utils.showToast('File too large. Maximum size is 10MB.');
+        els.fileInput.value = '';
+        return;
+      }
+      
+      // Validate file type and name
+      if (!file.type.includes('json') && !file.name.toLowerCase().endsWith('.json')) {
+        utils.showToast('Please select a valid JSON file.');
+        els.fileInput.value = '';
+        return;
+      }
+      
+      // Additional security: validate file name
+      const fileName = file.name.toLowerCase();
+      if (fileName.includes('..') || fileName.includes('/') || fileName.includes('\\')) {
+        utils.showToast('Invalid file name detected.');
+        els.fileInput.value = '';
+        return;
+      }
+      
+      // Check for suspicious file patterns
+      if (fileName.includes('script') || fileName.includes('exec') || fileName.includes('cmd')) {
+        utils.showToast('File name contains suspicious patterns.');
+        els.fileInput.value = '';
+        return;
+      }
+      
       try {
         const text = await file.text();
-        const data = JSON.parse(text);
         
-        if (!data.nodes || !Array.isArray(data.nodes)) {
-          throw new Error('Invalid file format');
+        // Validate JSON content
+        let data;
+        try {
+          // Check for suspicious content before parsing
+          if (text.includes('eval(') || text.includes('Function(') || text.includes('setTimeout(') || 
+              text.includes('setInterval(') || text.includes('<script') || text.includes('javascript:')) {
+            throw new Error('File contains potentially malicious content');
+          }
+          
+          data = JSON.parse(text);
+        } catch (parseError) {
+          throw new Error('Invalid JSON format: ' + parseError.message);
         }
         
-        state.nodes = data.nodes;
-        // Ensure links array exists on imported nodes
-        state.nodes.forEach(n => { if (!Array.isArray(n.links)) n.links = []; });
-        state.theme = data.theme || 'light';
-        state.gridSize = data.gridSize || 24;
+        // Validate data structure
+        if (!data || typeof data !== 'object') {
+          throw new Error('Invalid file format: root must be an object');
+        }
+        
+        if (!data.nodes || !Array.isArray(data.nodes)) {
+          throw new Error('Invalid file format: missing or invalid nodes array');
+        }
+        
+        // Validate nodes structure
+        const validNodes = [];
+        for (let i = 0; i < data.nodes.length; i++) {
+          const node = data.nodes[i];
+          if (!node || typeof node !== 'object') {
+            console.warn(`Skipping invalid node at index ${i}`);
+            continue;
+          }
+          
+          // Ensure required properties exist with defaults
+          const validNode = {
+            id: node.id || utils.genId(),
+            x: typeof node.x === 'number' ? node.x : 100,
+            y: typeof node.y === 'number' ? node.y : 100,
+            width: typeof node.width === 'number' ? Math.max(40, node.width) : 160,
+            height: typeof node.height === 'number' ? Math.max(40, node.height) : 80,
+            shape: node.shape || 'rect',
+            text: node.text || 'Imported Node',
+            fillColor: node.fillColor || '#ffffff',
+            strokeColor: node.strokeColor || '#333333',
+            textColor: node.textColor || '#111111',
+            fontFamily: node.fontFamily || 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial',
+            fontSize: typeof node.fontSize === 'number' ? Math.max(10, Math.min(48, node.fontSize)) : 16,
+            links: Array.isArray(node.links) ? node.links : [],
+            parentId: node.parentId || null,
+            edgeColor: node.edgeColor || '#888888',
+            edgeWidth: typeof node.edgeWidth === 'number' ? node.edgeWidth : 2,
+            edgeDash: Boolean(node.edgeDash),
+            zIndex: typeof node.zIndex === 'number' ? node.zIndex : validNodes.length
+          };
+          
+          // Validate and clamp size
+          utils.ensureValidSize(validNode);
+          validNodes.push(validNode);
+        }
+        
+        if (validNodes.length === 0) {
+          throw new Error('No valid nodes found in file');
+        }
+        
+        // Validate theme
+        const validTheme = (data.theme === 'dark' || data.theme === 'light') ? data.theme : 'light';
+        
+        // Validate grid size
+        const validGridSize = typeof data.gridSize === 'number' && 
+                             CONSTANTS.GRID_SIZES.includes(data.gridSize) ? data.gridSize : 24;
+        
+        // Apply imported data
+        state.nodes = validNodes;
+        state.theme = validTheme;
+        state.gridSize = validGridSize;
+        
+        // Update ID counter to avoid conflicts
+        const maxId = Math.max(...validNodes.map(n => n.id), 0);
+        state.idCounter = Math.max(state.idCounter, maxId + 1);
         
         historyManager.push();
         updateUI();
         updateThemeUI();
         render();
-        utils.showToast('File imported');
+        utils.showToast(`File imported successfully: ${validNodes.length} nodes loaded`);
       } catch (e) {
+        console.error('Import error:', e);
         utils.showToast('Import failed: ' + e.message);
       } finally {
         els.fileInput.value = '';
@@ -2576,7 +2799,23 @@ Arrow keys: Nudge nodes
     // Property panel event listeners with proper throttling
     const inputThrottle = utils.debounce(() => {
       if (!els.textInput) return;
-      selection.getNodes().forEach(n => { n.text = els.textInput.value; });
+      
+      // Validate and sanitize text input
+      let textValue = els.textInput.value;
+      
+      // Limit text length to prevent performance issues
+      const MAX_TEXT_LENGTH = 500;
+      if (textValue.length > MAX_TEXT_LENGTH) {
+        textValue = textValue.substring(0, MAX_TEXT_LENGTH);
+        els.textInput.value = textValue;
+        utils.showToast(`Text truncated to ${MAX_TEXT_LENGTH} characters`, 2000);
+      }
+      
+      // Remove potentially dangerous characters (basic XSS prevention)
+      textValue = textValue.replace(/[<>]/g, '');
+      
+      selection.getNodes().forEach(n => { n.text = textValue; });
+      historyManager.push();
       render();
     }, CONSTANTS.DEBOUNCE_DELAY);
     
@@ -2590,7 +2829,21 @@ Arrow keys: Nudge nodes
     });
     
     const colorInputHandler = utils.debounce((element, property) => {
-      selection.getNodes().forEach(n => { n[property] = element.value; });
+      if (!element || !element.value) return;
+      
+      // Validate color format (basic hex color validation)
+      const colorValue = element.value.trim();
+      if (!/^#[0-9A-Fa-f]{6}$/.test(colorValue)) {
+        // Reset to current value if invalid
+        const currentNodes = selection.getNodes();
+        if (currentNodes.length > 0) {
+          element.value = currentNodes[0][property];
+        }
+        return;
+      }
+      
+      selection.getNodes().forEach(n => { n[property] = colorValue; });
+      historyManager.push();
       render();
     }, 50);
     
@@ -2599,12 +2852,29 @@ Arrow keys: Nudge nodes
     if (els.textColor) els.textColor.addEventListener('input', () => colorInputHandler(els.textColor, 'textColor'));
     
     const sizeInputHandler = utils.debounce((element, property, isWidth) => {
-      const value = utils.clamp(utils.to8(Number(element.value)),
-                                isWidth ? CONSTANTS.MIN_SIZE.width : CONSTANTS.MIN_SIZE.height,
-                                isWidth ? CONSTANTS.MAX_SIZE.width : CONSTANTS.MAX_SIZE.height);
+      if (!element || !element.value) return;
+      
+      // Validate input is a valid number
+      const inputValue = Number(element.value);
+      if (isNaN(inputValue) || !isFinite(inputValue)) {
+        // Reset to current value if invalid
+        const currentNodes = selection.getNodes();
+        if (currentNodes.length > 0) {
+          element.value = currentNodes[0][property];
+        }
+        return;
+      }
+      
+      // Clamp to valid range
+      const minValue = isWidth ? CONSTANTS.MIN_SIZE.width : CONSTANTS.MIN_SIZE.height;
+      const maxValue = isWidth ? CONSTANTS.MAX_SIZE.width : CONSTANTS.MAX_SIZE.height;
+      const value = utils.clamp(utils.to8(inputValue), minValue, maxValue);
+      
+      // Update nodes
       selection.getNodes().forEach(n => { n[property] = value; });
       element.value = value;
       hitTestCache.clear();
+      historyManager.push();
       render();
     }, 100);
     
@@ -2612,8 +2882,23 @@ Arrow keys: Nudge nodes
     if (els.heightInput) els.heightInput.addEventListener('input', () => sizeInputHandler(els.heightInput, 'height', false));
     
     if (els.fontSize) els.fontSize.addEventListener('input', utils.debounce(() => {
-      const size = utils.clamp(Number(els.fontSize.value), 10, 48);
+      if (!els.fontSize || !els.fontSize.value) return;
+      
+      // Validate input is a valid number
+      const inputValue = Number(els.fontSize.value);
+      if (isNaN(inputValue) || !isFinite(inputValue)) {
+        // Reset to current value if invalid
+        const currentNodes = selection.getNodes();
+        if (currentNodes.length > 0) {
+          els.fontSize.value = currentNodes[0].fontSize;
+        }
+        return;
+      }
+      
+      const size = utils.clamp(inputValue, 10, 48);
       selection.getNodes().forEach(n => { n.fontSize = size; });
+      els.fontSize.value = size; // Update input to show clamped value
+      historyManager.push();
       render();
     }, 100));
     
