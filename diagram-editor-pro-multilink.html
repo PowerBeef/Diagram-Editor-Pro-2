@@ -990,14 +990,15 @@ Click to enter link mode, then:
         fontFamily: 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial',
         fontSize: 16,
         links: [],
-parentId: null,
+        parentId: null,
         edgeColor: '#888888',
         edgeWidth: 2,
         edgeDash: false,
         zIndex: state.nodes.length
       };
-      
+
       const node = { ...defaults, ...partial };
+      node.links = Array.isArray(node.links) ? [...node.links] : [];
       utils.ensureValidSize(node);
       utils.ensureValidPosition(node);
       state.nodes.push(node);
@@ -1006,9 +1007,9 @@ parentId: null,
       render();
       return node;
     },
-    
-    
-delete: (ids) => {
+
+
+    delete: (ids) => {
       const toDelete = new Set(Array.isArray(ids) ? ids : [ids]);
       const collectChildren = (id) => {
         state.nodes.filter(n => n.parentId === id).forEach(child => {
@@ -1038,17 +1039,18 @@ delete: (ids) => {
       toDuplicate.forEach(id => {
         const original = utils.getNode(id);
         if (!original) return;
-        
+
         const copy = nodeManager.create({
           ...original,
           id: utils.genId(),
           x: original.x + offset,
           y: original.y + offset,
-          parentId: null
+          parentId: null,
+          links: []
         });
         newNodes.push(copy);
       });
-      
+
       return newNodes;
     },
     
@@ -1126,13 +1128,17 @@ linkNodes: (parentId, childId) => {
     unlinkNodes: (childId) => {
       const child = utils.getNode(childId);
       if (!child) return false;
-      
+
       if (!child.parentId) {
         utils.showToast('Node is not linked to any parent');
         return false;
       }
-      
+
+      const previousParent = child.parentId;
       child.parentId = null;
+      if (Array.isArray(child.links)) {
+        child.links = child.links.filter(id => id !== previousParent);
+      }
       hitTestCache.clear();
       try { historyManager.push(); } catch (e) {}
       render();
@@ -1233,10 +1239,11 @@ wouldCreateCycle: (parentId, childId) => {
     alignCenter: () => {
       const nodes = selection.getNodes();
       if (nodes.length < 2) return;
-      
+
       const bounds = selection.getBounds();
       const centerX = bounds.x + bounds.width / 2;
       nodes.forEach(n => { n.x = centerX - n.width / 2; });
+      historyManager.push();
     },
     
     alignRight: () => {
@@ -1956,7 +1963,9 @@ wouldCreateCycle: (parentId, childId) => {
           ...node,
           id: utils.genId(),
           x: node.x + 20,
-          y: node.y + 20
+          y: node.y + 20,
+          parentId: null,
+          links: []
         });
       });
       
